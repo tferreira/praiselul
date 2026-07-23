@@ -122,45 +122,48 @@ def _session_recorded_break_minutes(session: dict[str, Any]) -> int:
     return sum(int(bp.get("minutes") or 0) for bp in session.get("breakPeriods") or [])
 
 
-def _open_session_work_minutes(session: dict[str, Any], now: datetime, tz: ZoneInfo) -> int:
-    """Net minutes worked in the in-progress session, measured up to ``now``.
+def _session_net_minutes(gross: int, recorded_break: int) -> int:
+    """Praise's per-session ``punch_priority`` break rule.
 
-    Mirrors Praise's per-session ``punch_priority`` break handling (which itself
-    matches RecoLul): a break already recorded for the session is subtracted and
-    suppresses the auto-break; otherwise the mandatory 1h break is deducted only
-    once this single session's gross reaches the threshold.
+    A break recorded within the session is deducted as-is and suppresses the
+    auto-break; otherwise the mandatory 1h break is deducted once the session's
+    gross *strictly exceeds* the 6h threshold — exactly 6h00 carries no break
+    obligation, matching Praise's ``resolveAutoBreakFloor``.
     """
-    clock_in = _parse_iso_to_local(session.get("clockIn"), tz)
-    if not clock_in:
-        return 0
-    gross = max(0, int((now - clock_in).total_seconds() / 60))
-
-    recorded_break = _session_recorded_break_minutes(session)
     if recorded_break > 0:
         deduction = recorded_break
-    elif gross >= _MIN_HOURS_FOR_MANDATORY_BREAK.minutes:
+    elif gross > _MIN_HOURS_FOR_MANDATORY_BREAK.minutes:
         deduction = _MANDATORY_BREAK.minutes
     else:
         deduction = 0
     return max(0, gross - deduction)
 
 
-def _closed_session_work_minutes(session: dict[str, Any], tz: ZoneInfo) -> int:
-    """Net minutes for a clocked-out session.
-
-    Closed sessions keep Praise's already-break-adjusted ``actualWorkMinutes``; a
-    closed session lacking that value has it derived from its clock-in/out span
-    minus any recorded break.
-    """
-    actual = session.get("actualWorkMinutes")
-    if actual is not None:
-        return int(actual)
+def _open_session_work_minutes(session: dict[str, Any], now: datetime, tz: ZoneInfo) -> int:
+    """Net minutes worked in the in-progress session, measured up to ``now``."""
     clock_in = _parse_iso_to_local(session.get("clockIn"), tz)
-    clock_out = _parse_iso_to_local(session.get("clockOut"), tz)
-    if clock_in and clock_out:
+    if not clock_in:
+        return 0
+    gross = max(0, int((now - clock_in).total_seconds() / 60))
+    return _session_net_minutes(gross, _session_recorded_break_minutes(session))
+
+
+def _closed_session_work_minutes(session: dict[str, Any], tz: ZoneInfo) -> int:
+    """Net minutes for a clocked-out session, with its pending auto-break applied.
+
+    Praise's session-level ``actualWorkMinutes`` deducts recorded breaks only —
+    the auto-break surfaces exclusively in the day-level aggregates, which stay
+    null while a later session is still open. So the break rule is re-applied
+    to the session's gross rather than trusting ``actualWorkMinutes`` verbatim.
+    """
+    gross = session.get("grossMinutes")
+    if gross is None:
+        clock_in = _parse_iso_to_local(session.get("clockIn"), tz)
+        clock_out = _parse_iso_to_local(session.get("clockOut"), tz)
+        if not (clock_in and clock_out):
+            return 0
         gross = max(0, int((clock_out - clock_in).total_seconds() / 60))
-        return max(0, gross - _session_recorded_break_minutes(session))
-    return 0
+    return _session_net_minutes(int(gross), _session_recorded_break_minutes(session))
 
 
 def _closed_day_worked_minutes(day: dict[str, Any], tz: ZoneInfo) -> int:
@@ -179,12 +182,12 @@ def _closed_day_worked_minutes(day: dict[str, Any], tz: ZoneInfo) -> int:
 def _current_day_worked_minutes(day: dict[str, Any], now: datetime, tz: ZoneInfo) -> int:
     """Live net work minutes for a day that still has an open session.
 
-    Sums per session: closed sessions keep Praise's already-break-adjusted
-    ``actualWorkMinutes``, and the open session is measured up to ``now`` with
-    the mandatory break applied only when no break is already recorded for it.
-    Because each session is handled independently, clocking in/out/in (a real
-    break) never triggers an extra auto-break, and inter-session gaps are not
-    counted as work.
+    Sums per session: closed sessions re-apply the per-session break rule to
+    their gross (Praise's session ``actualWorkMinutes`` hides the auto-break),
+    and the open session is measured up to ``now`` under the same rule. Because
+    each session is handled independently, clocking in/out/in (a real break)
+    never triggers an extra auto-break, and inter-session gaps are not counted
+    as work.
     """
     total = _closed_day_worked_minutes(day, tz)
     open_session = _open_session(day)
@@ -349,6 +352,18 @@ def get_leave_time(days: list[dict[str, Any]], config: Config, tz: ZoneInfo) -> 
     # lands in the past — i.e. you're already over.
     already_worked = Duration(_closed_day_worked_minutes(today, tz))
     remaining = required_today - already_worked
+
+    # A break already punched inside the open session suppresses the auto-break
+    # (punch priority) no matter how long the session runs, but its own minutes
+    # still push the departure back: the session must gross remaining + break.
+    open_recorded = _session_recorded_break_minutes(open_session)
+    if open_recorded > 0:
+        return [
+            LeaveTime(
+                includes_break=True,
+                min_time=clock_in + remaining + Duration(open_recorded),
+            )
+        ]
 
     leave_time_without_break = clock_in + remaining
     leave_time_with_break = clock_in + remaining + Duration(60)
