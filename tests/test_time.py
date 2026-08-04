@@ -822,6 +822,34 @@ def test_leave_time_credits_closed_session_net_of_pending_auto_break():
     assert leave_times == [LeaveTime(includes_break=False, min_time=Duration.parse("17:17"))]
 
 
+def test_leave_time_banks_closed_session_from_gross_minutes_not_punches():
+    """`when` credits the closed session from its reported ``grossMinutes``, not
+    from the clock-in/out span. Same precedence as `_closed_session_work_minutes`,
+    asserted here too so a regression can't slip through the leave-time path."""
+    days = [
+        _make_day("2026-04-07", actual_work_minutes=480),  # 0 balance → required_today = 480
+        _make_day(
+            "2026-04-08",
+            actual_work_minutes=400,  # day-level mirror of the closed session
+            clock_in="2026-04-08T08:00:00Z",
+            sessions=[
+                # Punches span 433 min, but the reported gross is 400.
+                _session(
+                    "2026-04-08T08:00:00Z",
+                    "2026-04-08T15:13:00Z",
+                    grossMinutes=400,
+                    breakMinutes=0,
+                ),
+                _session("2026-04-08T15:30:00Z", None),
+            ],
+        ),
+    ]
+    leave_times = get_leave_time(days, DEFAULT_CONFIG, TZ)
+    # banked = 400 - 60 = 340 → remaining = 140 → 15:30 + 2:20 = 17:50.
+    # Falling back to the punch-derived 433 would bank 373 and give 17:17.
+    assert leave_times == [LeaveTime(includes_break=False, min_time=Duration.parse("17:50"))]
+
+
 def test_latest_clock_in_time_uses_current_session():
     """balance's 'Last day' clock-in is the latest session's start, not the morning
     on-site one."""
