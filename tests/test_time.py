@@ -5,6 +5,7 @@ from praiselul.config import Config
 from praiselul.duration import Duration
 from praiselul.time import (
     LeaveTime,
+    _closed_day_worked_minutes,
     _current_day_worked_minutes,
     _day_actual_minutes,
     get_latest_clock_in_time,
@@ -537,6 +538,74 @@ def test_current_day_closed_session_at_exactly_6h_keeps_full_time():
     )
     # 360 (closed, no deduction at the boundary) + 30 (open) = 390
     assert _current_day_worked_minutes(day, NOW, TZ) == 390
+
+
+def test_current_day_closed_session_prefers_gross_minutes_over_punches():
+    """``grossMinutes`` is the authoritative gross for a closed session; the
+    clock-in/out punches are only a fallback. Pinned with a payload where the two
+    disagree so the precedence can't silently flip."""
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=None,
+        clock_in="2026-04-08T08:00:00Z",
+        sessions=[
+            # Punches span 433 min, but the reported gross is 400.
+            _session(
+                "2026-04-08T08:00:00Z",
+                "2026-04-08T15:13:00Z",
+                grossMinutes=400,
+                breakMinutes=0,
+            ),
+            _session("2026-04-08T15:30:00Z", None),
+        ],
+    )
+    # (400 - 60) + 30 (open 15:30–16:00) = 370 — the punch-derived 433 would give 403.
+    assert _current_day_worked_minutes(day, NOW, TZ) == 370
+
+
+def test_current_day_closed_session_falls_back_to_punches_without_gross_minutes():
+    """With no ``grossMinutes`` on the session, the clock-in/out span carries the
+    gross instead."""
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=None,
+        clock_in="2026-04-08T08:00:00Z",
+        sessions=[
+            _session("2026-04-08T08:00:00Z", "2026-04-08T15:13:00Z", breakMinutes=0),
+            _session("2026-04-08T15:30:00Z", None),
+        ],
+    )
+    # 08:00→15:13 = 433 → (433 - 60) + 30 = 403.
+    assert _current_day_worked_minutes(day, NOW, TZ) == 403
+
+
+def test_closed_day_two_long_sessions_each_lose_their_own_break():
+    """The break threshold is resolved per session, not per day: two breakless
+    6h01 sessions each owe their own hour. An inter-session gap already satisfies
+    the break obligation for the stint before it, so the day is not capped at one.
+    """
+    sessions = [
+        _session(
+            "2026-04-08T08:00:00Z",
+            "2026-04-08T14:01:00Z",
+            grossMinutes=361,
+            actualWorkMinutes=361,
+            breakMinutes=0,
+        ),
+        _session(
+            "2026-04-08T15:00:00Z",
+            "2026-04-08T21:01:00Z",
+            grossMinutes=361,
+            actualWorkMinutes=361,
+            breakMinutes=0,
+        ),
+    ]
+    # (361 - 60) * 2 = 602 — a day-level rule would deduct one hour and give 662.
+    assert _closed_day_worked_minutes(_make_day("2026-04-08", sessions=sessions), TZ) == 602
+    # And that is what Praise itself reports once the day is fully closed, so the
+    # live figure doesn't jump at the final clock-out.
+    fully_closed = _make_day("2026-04-08", actual_work_minutes=602, sessions=sessions)
+    assert _day_actual_minutes(fully_closed, TZ, NOW) == 602
 
 
 def test_current_day_recorded_break_suppresses_auto_break():
