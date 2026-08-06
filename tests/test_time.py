@@ -5,6 +5,7 @@ from praiselul.config import Config
 from praiselul.duration import Duration
 from praiselul.time import (
     LeaveTime,
+    _closed_day_worked_minutes,
     _current_day_worked_minutes,
     _day_actual_minutes,
     get_latest_clock_in_time,
@@ -444,11 +445,19 @@ def test_current_day_single_session_over_6h_applies_auto_break():
     assert _current_day_worked_minutes(day, NOW, TZ) == 360
 
 
-def test_current_day_single_session_at_6h_boundary_applies_auto_break():
-    """Exactly 6h hits the threshold (>=) → auto-break applies, matching RecoLul."""
-    # 10:00 → 16:00 = 6h = 360, no break → 360 - 60 = 300
+def test_current_day_single_session_at_6h_boundary_no_auto_break():
+    """Exactly 6h00 does NOT trip the threshold — Praise applies the break only
+    when gross *strictly exceeds* 6h, so neither do we."""
+    # 10:00 → 16:00 = 6h = 360 exactly → no deduction
     day = _make_open_day("2026-04-08", clock_in="2026-04-08T10:00:00Z")
-    assert _current_day_worked_minutes(day, NOW, TZ) == 300
+    assert _current_day_worked_minutes(day, NOW, TZ) == 360
+
+
+def test_current_day_single_session_just_over_6h_applies_auto_break():
+    """6h01 is over the threshold → the mandatory hour comes off."""
+    # 09:59 → 16:00 = 361 → 361 - 60 = 301
+    day = _make_open_day("2026-04-08", clock_in="2026-04-08T09:59:00Z")
+    assert _current_day_worked_minutes(day, NOW, TZ) == 301
 
 
 def test_current_day_single_session_under_6h_no_break():
@@ -474,20 +483,132 @@ def test_current_day_clock_in_out_in_no_auto_break():
     assert _current_day_worked_minutes(day, NOW, TZ) == 360
 
 
-def test_current_day_trusts_backend_actual_for_closed_sessions():
-    """Closed sessions use the backend's already-break-adjusted actualWorkMinutes verbatim."""
+def test_current_day_closed_session_deducts_recorded_break():
+    """A closed session's recorded break is deducted from its gross (punch
+    priority) — same 150 the backend reports as actualWorkMinutes."""
     day = _make_day(
         "2026-04-08",
         actual_work_minutes=None,
         clock_in="2026-04-08T09:00:00Z",
         sessions=[
-            # Backend says 150 (e.g. 3h gross minus a recorded 30-min break), not the 180 gross.
+            # 3h gross minus a recorded 30-min break → 150.
             _session("2026-04-08T09:00:00Z", "2026-04-08T12:00:00Z", actualWorkMinutes=150, breakMinutes=30),
             _session("2026-04-08T13:00:00Z", None),
         ],
     )
-    # 150 (trusted) + 180 (open 13:00–16:00, <6h) = 330
+    # 150 (closed) + 180 (open 13:00–16:00, <6h) = 330
     assert _current_day_worked_minutes(day, NOW, TZ) == 330
+
+
+def test_current_day_closed_breakless_session_over_6h_loses_auto_break():
+    """Regression (2026-07-22): Praise's session-level actualWorkMinutes hides
+    the auto-break, so a closed breakless 6h+ session banks its gross minus the
+    mandatory hour — not the face value the session payload claims."""
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=None,
+        clock_in="2026-04-08T08:00:00Z",
+        sessions=[
+            # grossMinutes present as in real Praise payloads; actualWorkMinutes
+            # equals gross because no break was punched.
+            _session(
+                "2026-04-08T08:00:00Z",
+                "2026-04-08T15:13:00Z",
+                grossMinutes=433,
+                actualWorkMinutes=433,
+                breakMinutes=0,
+            ),
+            _session("2026-04-08T15:30:00Z", None),
+        ],
+    )
+    # (433 - 60) + 30 (open 15:30–16:00) = 403 — NOT 433 + 30 = 463.
+    assert _current_day_worked_minutes(day, NOW, TZ) == 403
+
+
+def test_current_day_closed_session_at_exactly_6h_keeps_full_time():
+    """A closed breakless session of exactly 6h00 owes no break."""
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=None,
+        clock_in="2026-04-08T09:00:00Z",
+        sessions=[
+            _session("2026-04-08T09:00:00Z", "2026-04-08T15:00:00Z", actualWorkMinutes=360),
+            _session("2026-04-08T15:30:00Z", None),
+        ],
+    )
+    # 360 (closed, no deduction at the boundary) + 30 (open) = 390
+    assert _current_day_worked_minutes(day, NOW, TZ) == 390
+
+
+def test_current_day_closed_session_prefers_gross_minutes_over_punches():
+    """``grossMinutes`` is the authoritative gross for a closed session; the
+    clock-in/out punches are only a fallback. Pinned with a payload where the two
+    disagree so the precedence can't silently flip."""
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=None,
+        clock_in="2026-04-08T08:00:00Z",
+        sessions=[
+            # Punches span 433 min, but the reported gross is 400.
+            _session(
+                "2026-04-08T08:00:00Z",
+                "2026-04-08T15:13:00Z",
+                grossMinutes=400,
+                breakMinutes=0,
+            ),
+            _session("2026-04-08T15:30:00Z", None),
+        ],
+    )
+    # (400 - 60) + 30 (open 15:30–16:00) = 370 — the punch-derived 433 would give 403.
+    assert _current_day_worked_minutes(day, NOW, TZ) == 370
+
+
+def test_current_day_closed_session_falls_back_to_punches_without_gross_minutes():
+    """With no ``grossMinutes`` on the session, the clock-in/out span carries the
+    gross instead."""
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=None,
+        clock_in="2026-04-08T08:00:00Z",
+        sessions=[
+            _session("2026-04-08T08:00:00Z", "2026-04-08T15:13:00Z", breakMinutes=0),
+            _session("2026-04-08T15:30:00Z", None),
+        ],
+    )
+    # 08:00→15:13 = 433 → (433 - 60) + 30 = 403.
+    assert _current_day_worked_minutes(day, NOW, TZ) == 403
+
+
+def test_closed_day_two_long_sessions_each_lose_their_own_break():
+    """The break threshold is resolved per session, not per day: two breakless
+    6h01 sessions each owe their own hour. An inter-session gap already satisfies
+    the break obligation for the stint before it, so the day is not capped at one.
+    """
+    sessions = [
+        _session(
+            "2026-04-08T08:00:00Z",
+            "2026-04-08T14:01:00Z",
+            grossMinutes=361,
+            actualWorkMinutes=361,
+            breakMinutes=0,
+        ),
+        _session(
+            "2026-04-08T15:00:00Z",
+            "2026-04-08T21:01:00Z",
+            grossMinutes=361,
+            actualWorkMinutes=361,
+            breakMinutes=0,
+        ),
+    ]
+    # (361 - 60) * 2 = 602 — a day-level rule would deduct one hour and give 662.
+    assert _closed_day_worked_minutes(_make_day("2026-04-08", sessions=sessions), TZ) == 602
+    # The fixture below *documents* — it cannot verify — that Praise reports the same
+    # 602 at the day level once the day is fully closed, which is why the live figure
+    # doesn't jump at the final clock-out. With no open session `_day_actual_minutes`
+    # returns the day-level value verbatim, so all this asserts is that pass-through;
+    # the 602 itself rests on the backend's per-session summation, not on this test.
+    fully_closed = _make_day("2026-04-08", actual_work_minutes=602, sessions=sessions)
+    assert _day_actual_minutes(fully_closed, TZ, NOW) == 602
 
 
 def test_current_day_recorded_break_suppresses_auto_break():
@@ -622,6 +743,114 @@ def test_leave_time_office_credit_can_cover_target():
     # remaining = 360 - 360 = 0 → leave = remote clock-in (18:00), no break.
     leave_times = get_leave_time(days, DEFAULT_CONFIG, TZ)
     assert leave_times == [LeaveTime(includes_break=False, min_time=Duration.parse("18:00"))]
+
+
+def test_leave_time_open_session_recorded_break_pushes_departure():
+    """A break punched inside the open session suppresses the auto-break
+    scenarios (punch priority) but pushes departure back by its own length."""
+    days = [
+        _make_day("2026-04-07", actual_work_minutes=480),  # 0 balance → required_today = 480
+        _make_day(
+            "2026-04-08",
+            actual_work_minutes=None,
+            clock_in="2026-04-08T09:00:00Z",
+            sessions=[
+                _session(
+                    "2026-04-08T09:00:00Z",
+                    None,
+                    breakPeriods=[
+                        {"start": "2026-04-08T12:00:00Z", "end": "2026-04-08T12:30:00Z", "minutes": 30}
+                    ],
+                ),
+            ],
+        ),
+    ]
+    leave_times = get_leave_time(days, DEFAULT_CONFIG, TZ)
+    # Session must gross 480 + the 30 recorded → leave 09:00 + 8:30 = 17:30.
+    # Ignoring the recorded break would add the auto hour instead → 18:00.
+    assert leave_times == [LeaveTime(includes_break=True, min_time=Duration.parse("17:30"))]
+
+
+def test_leave_time_short_day_recorded_break_still_counts():
+    """Even when the remainder is under 6h (no auto-break in sight), a recorded
+    break must extend the stay — otherwise the day ends short by its length."""
+    days = [
+        _make_day("2026-04-07", actual_work_minutes=680),  # +200 → required_today = 280
+        _make_day(
+            "2026-04-08",
+            actual_work_minutes=None,
+            clock_in="2026-04-08T09:00:00Z",
+            sessions=[
+                _session(
+                    "2026-04-08T09:00:00Z",
+                    None,
+                    breakPeriods=[
+                        {"start": "2026-04-08T11:00:00Z", "end": "2026-04-08T11:45:00Z", "minutes": 45}
+                    ],
+                ),
+            ],
+        ),
+    ]
+    leave_times = get_leave_time(days, DEFAULT_CONFIG, TZ)
+    # 09:00 + 280min + 45min break = 14:25 (leaving at the naive 13:40 would
+    # bank only 235min once Praise deducts the recorded break).
+    assert leave_times == [LeaveTime(includes_break=True, min_time=Duration.parse("14:25"))]
+
+
+def test_leave_time_credits_closed_session_net_of_pending_auto_break():
+    """Regression (2026-07-22): `when` banked a closed breakless 6h+ session at
+    face value and suggested leaving an hour early — Praise deducted the
+    session's auto-break at final clock-out."""
+    days = [
+        _make_day("2026-04-07", actual_work_minutes=480),  # 0 balance → required_today = 480
+        _make_day(
+            "2026-04-08",
+            actual_work_minutes=433,  # day-level mirror of the closed session
+            clock_in="2026-04-08T08:00:00Z",
+            sessions=[
+                _session(
+                    "2026-04-08T08:00:00Z",
+                    "2026-04-08T15:13:00Z",
+                    grossMinutes=433,
+                    actualWorkMinutes=433,
+                    breakMinutes=0,
+                ),
+                _session("2026-04-08T15:30:00Z", None),
+            ],
+        ),
+    ]
+    leave_times = get_leave_time(days, DEFAULT_CONFIG, TZ)
+    # banked = 433 - 60 = 373 → remaining = 107 (<5h, no break) → 15:30 + 1:47 = 17:17.
+    # The buggy face-value banking gave remaining = 47 → 16:17, one hour early.
+    assert leave_times == [LeaveTime(includes_break=False, min_time=Duration.parse("17:17"))]
+
+
+def test_leave_time_banks_closed_session_from_gross_minutes_not_punches():
+    """`when` credits the closed session from its reported ``grossMinutes``, not
+    from the clock-in/out span. Same precedence as `_closed_session_work_minutes`,
+    asserted here too so a regression can't slip through the leave-time path."""
+    days = [
+        _make_day("2026-04-07", actual_work_minutes=480),  # 0 balance → required_today = 480
+        _make_day(
+            "2026-04-08",
+            actual_work_minutes=400,  # day-level mirror of the closed session
+            clock_in="2026-04-08T08:00:00Z",
+            sessions=[
+                # Punches span 433 min, but the reported gross is 400.
+                _session(
+                    "2026-04-08T08:00:00Z",
+                    "2026-04-08T15:13:00Z",
+                    grossMinutes=400,
+                    breakMinutes=0,
+                ),
+                _session("2026-04-08T15:30:00Z", None),
+            ],
+        ),
+    ]
+    leave_times = get_leave_time(days, DEFAULT_CONFIG, TZ)
+    # banked = 400 - 60 = 340 → remaining = 140 → 15:30 + 2:20 = 17:50.
+    # Falling back to the punch-derived 433 would bank 373 and give 17:17.
+    assert leave_times == [LeaveTime(includes_break=False, min_time=Duration.parse("17:50"))]
 
 
 def test_latest_clock_in_time_uses_current_session():
