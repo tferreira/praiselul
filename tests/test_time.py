@@ -602,8 +602,11 @@ def test_closed_day_two_long_sessions_each_lose_their_own_break():
     ]
     # (361 - 60) * 2 = 602 — a day-level rule would deduct one hour and give 662.
     assert _closed_day_worked_minutes(_make_day("2026-04-08", sessions=sessions), TZ) == 602
-    # And that is what Praise itself reports once the day is fully closed, so the
-    # live figure doesn't jump at the final clock-out.
+    # The fixture below *documents* — it cannot verify — that Praise reports the same
+    # 602 at the day level once the day is fully closed, which is why the live figure
+    # doesn't jump at the final clock-out. With no open session `_day_actual_minutes`
+    # returns the day-level value verbatim, so all this asserts is that pass-through;
+    # the 602 itself rests on the backend's per-session summation, not on this test.
     fully_closed = _make_day("2026-04-08", actual_work_minutes=602, sessions=sessions)
     assert _day_actual_minutes(fully_closed, TZ, NOW) == 602
 
