@@ -279,16 +279,76 @@ def test_overtime_balance():
 # --- get_workplace_times ---
 
 
+_OFFICE = "loc-office"
+_WFH = "loc-wfh"
+_LOCATIONS = [
+    {"id": _OFFICE, "name": "Office", "category": "on_site"},
+    {"id": _WFH, "name": "WFH", "category": "remote"},
+]
+_WORKPLACE_NOW = datetime(2026, 4, 8, 16, 0, tzinfo=TZ)
+
+
 def test_workplace_times():
     summary = {"onSiteMinutes": 2400, "remoteMinutes": 600}
-    result = get_workplace_times(summary)
+    result = get_workplace_times(summary, [], _LOCATIONS, TZ)
     assert result == {"On-site": Duration(2400), "Remote": Duration(600)}
 
 
 def test_workplace_times_no_remote():
     summary = {"onSiteMinutes": 2400, "remoteMinutes": 0}
-    result = get_workplace_times(summary)
+    result = get_workplace_times(summary, [], _LOCATIONS, TZ)
     assert result == {"On-site": Duration(2400)}
+
+
+def test_workplace_times_adds_sessions_of_unaggregated_day():
+    """Clock out then back in: Praise nulls the day totals while the new session
+    runs, so the summary drops the whole day. Both sessions are added back live."""
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=None,
+        sessions=[
+            # 08:00 → 15:00 = 420 gross, breakless → 360 after the auto-break
+            _session("2026-04-08T08:00:00Z", "2026-04-08T15:00:00Z", grossMinutes=420, locationId=_WFH),
+            _session("2026-04-08T15:50:00Z", None, locationId=_WFH),  # 10 min so far
+        ],
+    )
+    summary = {"onSiteMinutes": 2400, "remoteMinutes": 600}
+    result = get_workplace_times(summary, [day], _LOCATIONS, TZ, _WORKPLACE_NOW)
+    assert result == {"On-site": Duration(2400), "Remote": Duration(600 + 360 + 10)}
+
+
+def test_workplace_times_adds_only_open_session_when_day_total_present():
+    """If the day total already covers the closed session, only the open one is missing."""
+    day = _make_office_then_remote_day(
+        "2026-04-08",
+        office_in="2026-04-08T09:00:00Z",
+        office_out="2026-04-08T12:00:00Z",
+        office_minutes=180,
+        remote_in="2026-04-08T13:00:00Z",
+    )
+    day["sessions"][0]["locationId"] = _OFFICE
+    day["sessions"][1]["locationId"] = _WFH
+    summary = {"onSiteMinutes": 180, "remoteMinutes": 0}
+    result = get_workplace_times(summary, [day], _LOCATIONS, TZ, _WORKPLACE_NOW)
+    assert result == {"On-site": Duration(180), "Remote": Duration(180)}
+
+
+def test_workplace_times_ignores_aggregated_closed_day():
+    day = _make_day(
+        "2026-04-08",
+        actual_work_minutes=360,
+        sessions=[_session("2026-04-08T08:00:00Z", "2026-04-08T15:00:00Z", grossMinutes=420, locationId=_WFH)],
+    )
+    summary = {"onSiteMinutes": 0, "remoteMinutes": 360}
+    result = get_workplace_times(summary, [day], _LOCATIONS, TZ, _WORKPLACE_NOW)
+    assert result == {"Remote": Duration(360)}
+
+
+def test_workplace_times_skips_unknown_location():
+    day = _make_day("2026-04-08", sessions=[_session("2026-04-08T13:00:00Z", None, locationId="archived")])
+    summary = {"onSiteMinutes": 0, "remoteMinutes": 600}
+    result = get_workplace_times(summary, [day], _LOCATIONS, TZ, _WORKPLACE_NOW)
+    assert result == {"Remote": Duration(600)}
 
 
 # --- get_leave_time ---

@@ -91,6 +91,14 @@ class PraiseSession:
             raise RuntimeError(f"API error: {data.get('error', {}).get('code', 'unknown')}")
         return data["data"]
 
+    def get_clock_locations(self) -> list[dict[str, Any]]:
+        response = self._get(f"{self._base_url}/api/time/clock/locations")
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError(f"API error: {data.get('error', {}).get('code', 'unknown')}")
+        return data["data"]
+
     def _get(self, url: str, **kwargs) -> requests.Response:
         """GET that recovers once from an expired or revoked token (401) by
         re-running the device flow and retrying. A caller-supplied PRAISE_TOKEN

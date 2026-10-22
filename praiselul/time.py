@@ -242,16 +242,58 @@ def get_overtime_balance(days: list[dict[str, Any]], config: Config, tz: ZoneInf
     return sum(history, Duration())
 
 
-def get_workplace_times(summary: dict[str, Any]) -> dict[str, Duration]:
-    """Extract workplace breakdown from the timesheet summary."""
-    result = {}
-    on_site = summary.get("onSiteMinutes", 0)
-    remote = summary.get("remoteMinutes", 0)
-    if on_site:
-        result["On-site"] = Duration.from_minutes(on_site)
-    if remote:
-        result["Remote"] = Duration.from_minutes(remote)
+_WORKPLACE_LABELS = {"on_site": "On-site", "remote": "Remote"}
+
+
+def _unaggregated_session_minutes(
+    day: dict[str, Any], tz: ZoneInfo, now: datetime,
+) -> list[tuple[str | None, int]]:
+    """(locationId, net minutes) for sessions the timesheet summary hasn't counted yet.
+
+    The summary sums day-level aggregates, which Praise leaves null while a later
+    session is still open — so clocking out and back in drops the whole day from
+    ``onSiteMinutes`` / ``remoteMinutes`` until the final clock-out. Praise's own UI
+    adds those minutes back live; this mirrors it. When the day total is present the
+    closed sessions are already counted and only the open one is missing.
+    """
+    open_session = _open_session(day)
+    if day.get("actualWorkMinutes") is None:
+        closed = [s for s in day.get("sessions") or [] if s.get("clockOut")]
+    elif open_session is not None:
+        closed = []
+    else:
+        return []
+    result = [(s.get("locationId"), _closed_session_work_minutes(s, tz)) for s in closed]
+    if open_session is not None:
+        result.append((open_session.get("locationId"), _open_session_work_minutes(open_session, now, tz)))
     return result
+
+
+def get_workplace_times(
+    summary: dict[str, Any],
+    days: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+    tz: ZoneInfo,
+    now: datetime | None = None,
+) -> dict[str, Duration]:
+    """Workplace breakdown: the timesheet summary plus sessions it hasn't aggregated yet.
+
+    ``locations`` comes from the clock-locations endpoint, which carries each
+    location's ``on_site`` / ``remote`` category; sessions at a location missing
+    from it (e.g. archived) are left out.
+    """
+    minutes = {
+        "On-site": summary.get("onSiteMinutes", 0),
+        "Remote": summary.get("remoteMinutes", 0),
+    }
+    now = now or datetime.now(tz)
+    categories = {loc["id"]: loc.get("category") for loc in locations}
+    for day in days:
+        for location_id, session_minutes in _unaggregated_session_minutes(day, tz, now):
+            label = _WORKPLACE_LABELS.get(categories.get(location_id))
+            if label:
+                minutes[label] += session_minutes
+    return {label: Duration.from_minutes(m) for label, m in minutes.items() if m}
 
 
 def get_today_record(days: list[dict[str, Any]], tz: ZoneInfo) -> dict[str, Any] | None:
